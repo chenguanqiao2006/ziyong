@@ -2,7 +2,7 @@
 A股定时拉取脚本，配合 GitHub Actions
 数据源：akshare
 拉取内容：A股交易日判断、全市场日线、北向资金、龙虎榜
-逻辑：增量拉取当日数据；非交易日直接退出
+修复点：确保文件夹创建；异常捕获打印详细错误；非交易日不生成文件
 适配量学建模：后续可扩展量柱计算、量化对倒识别
 """
 import os
@@ -15,7 +15,7 @@ DATA_DIR = "./data"  # 数据保存目录
 TODAY = datetime.now().strftime("%Y-%m-%d")
 # =======================================================
 
-# 创建数据文件夹
+# 创建数据文件夹，确保目录一定存在
 os.makedirs(DATA_DIR, exist_ok=True)
 
 def is_a_stock_trade_day(date_str: str) -> bool:
@@ -30,9 +30,9 @@ def is_a_stock_trade_day(date_str: str) -> bool:
 if __name__ == "__main__":
     print(f"===== 开始执行：{TODAY} =====")
 
-    # 非交易日直接退出
+    # 非交易日直接退出，不生成任何csv
     if not is_a_stock_trade_day(TODAY):
-        print("今日不是A股交易日，程序退出")
+        print("今日不是A股交易日，程序退出，不生成数据文件")
         exit(0)
 
     # 1. 拉取全市场A股当日行情日线
