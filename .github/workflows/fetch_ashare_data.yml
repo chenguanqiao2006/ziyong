@@ -1,49 +1,70 @@
+# =====================================================================
+# A股每日数据拉取工作流
+# 触发方式：
+#   1. 每天 北京时间20:30（UTC 12:30）主力运行：快照+龙虎榜+北向+增量追加
+#   2. 每天 北京时间23:00（UTC 15:00）兜底重跑：已完成的全跳过，重跑无害
+#   3. 手动触发：请在交易日15:30之后点击（时间闸门会拦截盘前/盘中触发）
+# 与历史初始化工作流共用互斥锁，任务之间永不撞车
+# =====================================================================
 name: A股定时拉取数据
 
-# UTC时间：0 9 * * 1-5 → 北京时间 17:00 周一至周五
 on:
+  workflow_dispatch: {}   # 允许手动触发
+
   schedule:
-    - cron: '0 9 * * 1-5'
-  # 支持手动点击运行测试
-  workflow_dispatch:
+    # 北京时间20:30 主力（UTC 12:30）
+    - cron: '30 12 * * 1-5'
+    # 北京时间23:00 兜底（UTC 15:00）
+    - cron: '0 15 * * 1-5'
+
+# 互斥锁：数据相关任务同一时间只允许一个实例运行（与历史初始化共用）
+concurrency:
+  group: ashare-data-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
-  fetch_data:
+  daily-fetch:
     runs-on: ubuntu-latest
+    timeout-minutes: 120   # 快照几分钟 + 增量追加约40分钟，2小时上限富余
+
     steps:
-      - name: 检出代码仓库
+      # 1. 拉取仓库代码
+      - name: 检出仓库
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # ========== 新增：设置系统时区为上海（北京时间） ==========
-      - name: 设置时区为Asia/Shanghai
-        run: |
-          sudo timedatectl set-timezone Asia/Shanghai
-          echo "TZ=Asia/Shanghai" >> $GITHUB_ENV
-
-      - name: 设置Python环境
+      # 2. 配置Python环境
+      - name: 配置Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: 安装依赖 akshare pandas
+      # 3. 安装依赖
+      - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install akshare pandas
 
-      - name: 运行A股数据拉取脚本
-        run: python fetch_ashare_data.py
+      # 4. 运行每日快照脚本（快照+龙虎榜+北向+断档检查，内置时间闸门）
+      - name: 运行每日快照
+        run: python src/fetch_ashare_data.py
 
-      - name: 提交更新的数据文件
+      # 5. 运行每日增量追加脚本（自愈式补齐历史库，内置时间闸门+初始化检测）
+      - name: 运行增量追加
+        run: python src/daily_append.py
+
+      # 6. 提交数据回仓库
+      - name: 提交数据
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          # 判断是否存在csv文件，有文件才add，没有直接跳过
-          if [ -n "$(ls ./data/*.csv 2>/dev/null)" ]; then
-            git add ./data/*.csv
-            git commit -m "🤖 自动更新A股行情数据 $(date +'%Y-%m-%d')"
-            git push
+          git config user.name "github-actions[bot]"
+          git commit -m "数据更新：每日快照+增量追加 $(date '+%Y-%m-%d %H:%M')" --allow-empty 2>/dev/null || true
+          git add data/
+          if git diff --cached --quiet; then
+            echo "本次没有新数据产生，跳过提交"
           else
-            echo "✅ data目录下没有新csv文件，跳过git提交"
+            git commit -m "数据更新：每日快照+增量追加 $(date '+%Y-%m-%d %H:%M')"
+            git push
           fi
