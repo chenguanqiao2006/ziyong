@@ -1,11 +1,12 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-A股历史数据初始化脚本（baostock主源·双轮版 v8，2026-10-09）
+A股历史数据初始化脚本（baostock主源·双轮版 v9，2026-10-09）
 架构（借鉴用户旧脚本 fetch_quotes.py 的成熟经验）：
   第一轮（主源）：baostock 单线程批量拉取
     - 免费、无需注册、无限流，走私有协议不受海外IP拦截影响
     - 一次 bs.login() 长连接，逐只 query，约130ms/只，全市场约11分钟
     - ⚠️ baostock 非线程安全，必须单线程使用
-    - 字段直接支持全部9列：date/open/close/high/low/volume/amount/pctChg/turn
   第二轮（补源）：baostock 失败的股票用 5并发裸接口补拉
     - 东财 push2his（带Referer，海外IP可通）→ 腾讯 → 新浪，逐源降级+熔断
 
@@ -13,16 +14,22 @@ A股历史数据初始化脚本（baostock主源·双轮版 v8，2026-10-09）
 - 输出：data/history/股票代码.csv，9列
   date/open/close/high/low/volume/amount/pct_chg/turnover
 - 断点续传、覆盖模式(FORCE_OVERWRITE=1)、北交所剔除、体积监控
+- 编码 utf-8-sig（与 monthly_refresh / daily_append 统一）
 
-v7修复：股票清单筛选逻辑bug——v6中北交所规范化返回(None,None)元组，
-  旧写法filter(None,...)无法过滤元组导致排序报错
-  'NoneType' and 'str'，改用集合推导式 if c 显式剔除。
-
-v8变更（2026-10-09）：
-- 删除北向资金拉取：stock_hsgt_hist_em 自 2024-08-19 起不再产出新数据，
-  接口返回停在 2024-08-19，留着只会误导和浪费一次 API 调用
-- 编码保持 utf-8-sig（与 monthly_refresh / daily_append 统一）
+v9变更（2026-10-09）：
+- 🔴 修复东财解析字段错位：v8的fetch_em从close起整体右移一位
+  （close取到high、low取到手数、volume取到成交额、amount取到涨跌幅…）。
+  fields2=f51,f52,f53,f54,f55,f56,f57,f59,f61 的真实返回顺序是
+  date,open,close,high,low,volume(手),amount,pct_chg,turnover，已按此修正，
+  且 turnover 启用 p[8]（v8恒为None）
+- 🔴 落盘格式与 daily/monthly 字节级统一：价格两位小数、volume整数(手)、
+  涨跌幅两位。v8用pandas to_csv会输出 "1512.0"/"31000.0"/"-0.331126" 等
+  浮点全精度格式，与月度刷新的 "1512.00"/"31000"/"-0.33" 不一致；
+  v9起灾备重建产物与月度刷新口径一致，避免重建后再来一次全量churn
+- 停牌日（close/volume为空）跳过，与 monthly/daily 口径一致
+- 原子写盘（tmp + os.replace），中途挂掉不留半截文件
 """
+import csv
 import os
 import re
 import json
@@ -32,15 +39,13 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
-import pandas as pd
-
 # ===================== 路径定位（基于脚本自身位置） =====================
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HISTORY_DIR = os.path.join(PROJECT_ROOT, "data", "history")
 # ======================================================================
 
 # ===================== 可配置参数区 =====================
-HISTORY_YEARS = 2        # 拉取几年历史
+HISTORY_YEARS = 2        # 拉取几年历史（与 monthly_refresh 的 KEEP_YEARS 对齐）
 DATALEN = 550            # 裸接口单次请求K线根数（2年约490根，留余量）
 MAX_WORKERS = 5          # 第二轮补拉并发数
 RETRY_TIMES = 2          # 第二轮单源单只重试次数
@@ -56,7 +61,7 @@ FORCE_OVERWRITE = os.environ.get("FORCE_OVERWRITE", "0") == "1"
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
 now = datetime.now()
-START_DATE_BS = (now - timedelta(days=365 * HISTORY_YEARS)).strftime("%Y-%m-%d")  # baostock用横杠
+START_DATE_BS = (now - timedelta(days=365 * HISTORY_YEARS)).strftime("%Y-%m-%d")
 END_DATE_BS = now.strftime("%Y-%m-%d")
 
 STD_COLS = ["date", "open", "close", "high", "low", "volume", "amount", "pct_chg", "turnover"]
@@ -72,6 +77,29 @@ LOCK = threading.Lock()
 STATE = {"consec_fail": {"东财": 0, "新浪": 0, "腾讯": 0},
          "dead": {"东财": False, "新浪": False, "腾讯": False}}
 SRC_COUNT = {"baostock": 0, "东财": 0, "新浪": 0, "腾讯": 0}
+
+
+# ===================== 统一格式化（与 monthly/daily 字节级一致） =====================
+def _fmt(x, nd=2):
+    try:
+        return f"{float(x):.{nd}f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def save_rows(code, rows):
+    """rows: {date: 9列标准行} → 原子写盘 utf-8-sig。返回写入行数（0=不落盘）"""
+    if not rows:
+        return 0
+    path = os.path.join(HISTORY_DIR, f"{code}.csv")
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(STD_COLS)
+        for d in sorted(rows):
+            w.writerow(rows[d])
+    os.replace(tmp, path)
+    return len(rows)
 
 
 # ===================== 代码规范化 =====================
@@ -93,7 +121,8 @@ def normalize_symbol(raw):
 def run_baostock_batch(pairs):
     """
     baostock 单线程批量拉取全部股票。
-    返回 (成功DataFrame字典, 失败代码列表)
+    返回 (成功{code: rows字典}, 失败代码列表)
+    行构造与 monthly_refresh.refresh_one 完全一致（字节级）。
     """
     import baostock as bs
 
@@ -109,7 +138,6 @@ def run_baostock_batch(pairs):
 
     try:
         for i, (code, symbol) in enumerate(pairs, 1):
-            # baostock 代码格式：sh.600519 / sz.000688
             bs_code = f"{symbol[:2]}.{symbol[2:]}"
             try:
                 rs = bs.query_history_k_data_plus(
@@ -117,22 +145,20 @@ def run_baostock_batch(pairs):
                     "date,open,high,low,close,volume,amount,pctChg,turn",
                     start_date=START_DATE_BS, end_date=END_DATE_BS,
                     frequency="d", adjustflag="2")  # 2=前复权
-                rows = []
+                rows = {}
                 while rs.error_code == '0' and rs.next():
-                    rows.append(rs.get_row_data())
+                    r = rs.get_row_data()
+                    if not r[4] or not r[5]:          # 停牌日跳过（口径统一）
+                        continue
+                    try:
+                        vol = int(round(float(r[5]) / 100))   # 股→手
+                    except ValueError:
+                        continue
+                    # baostock字段序 date,open,high,low,close,... → CSV列序
+                    rows[r[0]] = [r[0], _fmt(r[1]), _fmt(r[4]), _fmt(r[2]), _fmt(r[3]),
+                                  vol, _fmt(r[6]), _fmt(r[7]), _fmt(r[8])]
                 if rows:
-                    df = pd.DataFrame(rows, columns=rs.fields)
-                    df = df.rename(columns={
-                        "date": "date", "open": "open", "close": "close",
-                        "high": "high", "low": "low", "volume": "volume",
-                        "amount": "amount", "pctChg": "pct_chg", "turn": "turnover"})
-                    df = df[STD_COLS]
-                    for c in STD_COLS[1:]:
-                        df[c] = pd.to_numeric(df[c], errors="coerce")
-                    # baostock volume 单位是"股"，统一为"手"
-                    df["volume"] = df["volume"] / 100
-                    df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
-                    success[code] = df
+                    success[code] = rows
                 else:
                     failed.append(code)
             except Exception:
@@ -154,7 +180,10 @@ def run_baostock_batch(pairs):
 
 # ===================== 第二轮：裸接口补拉（5并发） =====================
 def fetch_em(symbol):
-    """补源①：东财 push2his（带Referer，海外IP实测可通）"""
+    """补源①：东财 push2his（带Referer，海外IP实测可通）
+    fields2=f51,f52,f53,f54,f55,f56,f57,f59,f61 → 每行按此顺序返回：
+      date,open,close,high,low,volume(手),amount,pct_chg,turnover
+    ⚠️ v8曾在此错位（close起右移一位），v9已修正"""
     mkt = '1' if symbol.startswith('sh') else '0'
     url = ('https://push2his.eastmoney.com/api/qt/stock/kline/get?'
            f'secid={mkt}.{symbol[2:]}&fields1=f1,f2,f3,f4,f5,f6'
@@ -162,95 +191,86 @@ def fetch_em(symbol):
            f'&klt=101&fqt=1&end=20500101&lmt={DATALEN}')
     j = requests.get(url, headers=UA, timeout=TIMEOUT).json()
     rows = (j.get('data') or {}).get('klines') or []
-    out = []
+    out = {}
     for line in rows:
         p = line.split(',')
-        if len(p) >= 9:
-            out.append({"date": p[0], "open": p[1], "close": p[3],
-                        "high": p[4], "low": p[5], "volume": p[6],
-                        "amount": p[7], "pct_chg": p[8], "turnover": None})
+        if len(p) < 9:
+            continue
+        try:
+            vol = int(round(float(p[5])))        # 东财volume已是手，不除
+        except ValueError:
+            continue
+        out[p[0]] = [p[0], _fmt(p[1]), _fmt(p[2]), _fmt(p[3]), _fmt(p[4]),
+                     vol, _fmt(p[6]), _fmt(p[7]), _fmt(p[8])]
     return out
 
 
 def fetch_tx(symbol):
-    """补源②：腾讯"""
+    """补源②：腾讯。行: [date,open,close,high,low,volume(手),...]
+    无amount/turn，pct本地接力计算（月度刷新会用官方值重写覆盖）"""
     url = ('https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?'
            f'param={symbol},day,,,{DATALEN},qfq')
     j = requests.get(url, headers=UA, timeout=TIMEOUT).json()
     node = (j.get('data') or {}).get(symbol) or {}
     rows = node.get('qfqday') or node.get('day') or []
-    out = []
+    out = {}
+    prev_c = None
     for r in rows:
-        if len(r) >= 6:
-            out.append({"date": r[0], "open": r[1], "close": r[2],
-                        "high": r[3], "low": r[4], "volume": r[5],
-                        "amount": r[6] if len(r) > 6 and r[6] else None,
-                        "pct_chg": None, "turnover": None})
-    for i in range(1, len(out)):
+        if len(r) < 6:
+            continue
         try:
-            prev_c = float(out[i-1]["close"])
-            cur_c = float(out[i]["close"])
-            out[i]["pct_chg"] = round((cur_c - prev_c) / prev_c * 100, 2)
-        except (ValueError, ZeroDivisionError):
-            pass
+            vol = int(round(float(r[5])))        # 腾讯已是手，不除
+            c = float(r[2])
+        except (TypeError, ValueError):
+            continue
+        pct = _fmt((c / prev_c - 1) * 100) if prev_c else ""
+        out[r[0]] = [r[0], _fmt(r[1]), _fmt(r[2]), _fmt(r[3]), _fmt(r[4]),
+                     vol, "", pct, ""]
+        prev_c = c
     return out
 
 
 def fetch_sina(symbol):
-    """补源③：新浪"""
+    """补源③：新浪。volume单位是股，/100转手；
+    无amount/turn，pct本地接力计算（月度刷新会用官方值重写覆盖）"""
     url = ('https://quotes.sina.cn/cn/api/jsonp_v2.php/var/CN_MarketDataService.'
            f'getKLineData?symbol={symbol}&scale=240&ma=no&datalen={DATALEN}')
     t = requests.get(url, headers=UA, timeout=TIMEOUT).text
     m = re.search(r'\[.*\]', t, re.S)
     if not m:
-        return []
-    out = []
+        return {}
+    out = {}
+    prev_c = None
     for d in json.loads(m.group(0)):
         try:
-            out.append({"date": d['day'], "open": d['open'], "close": d['close'],
-                        "high": d['high'], "low": d['low'], "volume": d['volume'],
-                        "amount": None, "pct_chg": None, "turnover": None})
+            vol = int(round(float(d['volume']) / 100))   # 股→手
+            c = float(d['close'])
         except (KeyError, TypeError, ValueError):
             continue
-    for i in range(1, len(out)):
-        try:
-            prev_c = float(out[i-1]["close"])
-            cur_c = float(out[i]["close"])
-            out[i]["pct_chg"] = round((cur_c - prev_c) / prev_c * 100, 2)
-        except (ValueError, ZeroDivisionError):
-            pass
+        pct = _fmt((c / prev_c - 1) * 100) if prev_c else ""
+        out[d['day']] = [d['day'], _fmt(d['open']), _fmt(d['close']),
+                         _fmt(d['high']), _fmt(d['low']), vol, "", pct, ""]
+        prev_c = c
     return out
 
 
 def fetch_one_round2(code, symbol):
-    """第二轮逐源降级抓取单只。返回 DataFrame / None(空) / 'FAIL'"""
+    """第二轮逐源降级抓取单只。返回 rows字典 / None(空) / 'FAIL'"""
     with LOCK:
         sources = [(n, f) for n, f in (("东财", fetch_em), ("腾讯", fetch_tx), ("新浪", fetch_sina))
                    if not STATE["dead"][n]]
 
-    last_err = None
     for name, fn in sources:
         for i in range(RETRY_TIMES + 1):
             try:
                 rows = fn(symbol)
                 if not rows:
                     return None
-                df = pd.DataFrame(rows)
-                for c in STD_COLS[1:]:
-                    if c not in df.columns:
-                        df[c] = None
-                df = df[STD_COLS]
-                for c in STD_COLS[1:]:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-                if name == "新浪":
-                    df["volume"] = df["volume"] / 100
-                df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
                 with LOCK:
                     STATE["consec_fail"][name] = 0
                     SRC_COUNT[name] += 1
-                return df
-            except Exception as e:
-                last_err = e
+                return rows
+            except Exception:
                 if i < RETRY_TIMES:
                     time.sleep(1)
         with LOCK:
@@ -266,7 +286,6 @@ def get_all_stock_codes():
     """返回 [(纯代码, 带前缀代码), ...]。降级：东财→交易所官网→新浪"""
 
     def to_pairs(df, col):
-        """先规范化出(代码,前缀代码)，再 if c 剔除北交所的(None,None)"""
         return sorted({(c, s) for c, s in (normalize_symbol(x) for x in df[col].tolist()) if c})
 
     import akshare as ak
@@ -329,7 +348,7 @@ def clean_overwrite_dir():
 # ===================== 主流程 =====================
 if __name__ == "__main__":
     print("=" * 60)
-    print("===== A股历史数据初始化开始（baostock主源·双轮版 v8） =====")
+    print("===== A股历史数据初始化开始（baostock主源·双轮版 v9） =====")
     print(f"===== 当前时间：{now} =====")
     print(f"===== 拉取范围：{HISTORY_YEARS} 年（{START_DATE_BS.replace('-', '')} ~ {END_DATE_BS.replace('-', '')}）=====")
     print(f"===== 复权方式：前复权（qfq）=====")
@@ -366,11 +385,10 @@ if __name__ == "__main__":
     bs_success, bs_failed = run_baostock_batch(todo_pairs)
 
     # 落盘第一轮成功的
-    for code, df in bs_success.items():
-        save_path = os.path.join(HISTORY_DIR, f"{code}.csv")
-        df.to_csv(save_path, index=False, encoding="utf-8-sig")
-        success_count += 1
-        SRC_COUNT["baostock"] += 1
+    for code, rows in bs_success.items():
+        if save_rows(code, rows):
+            success_count += 1
+            SRC_COUNT["baostock"] += 1
 
     # ============ 第二轮：裸接口补拉 baostock 失败的 ============
     round2_pairs = [(c, s) for c, s in todo_pairs if c in set(bs_failed)]
@@ -381,12 +399,11 @@ if __name__ == "__main__":
 
         def worker(pair):
             code, symbol = pair
-            save_path = os.path.join(HISTORY_DIR, f"{code}.csv")
-            if os.path.exists(save_path):
+            if os.path.exists(os.path.join(HISTORY_DIR, f"{code}.csv")):
                 return "skip"
             result = fetch_one_round2(code, symbol)
-            if isinstance(result, pd.DataFrame):
-                result.to_csv(save_path, index=False, encoding="utf-8-sig")
+            if isinstance(result, dict):
+                save_rows(code, result)
                 return "ok"
             elif result is None:
                 return "empty"
