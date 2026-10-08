@@ -8,15 +8,14 @@ on:
 permissions:
   contents: write             # 允许 bot 推送数据提交
 
-# 互斥锁：与历史初始化/月度刷新共用同一group，任何数据任务互斥
 concurrency:
-  group: ashare-data-pipeline
-  cancel-in-progress: false
+  group: ashare-data-pipeline # ★ 三个workflow共用同一group：任何两个都不会同时跑
+  cancel-in-progress: false   # 撞车时排队，不互相打断
 
 jobs:
   daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 90       # baostock预算40分钟+兜底+写盘，留足余量
+    timeout-minutes: 90       # 预算50min+兜底+扫描+写盘，留足余量
     steps:
       - uses: actions/checkout@v4
 
@@ -25,10 +24,8 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 安装依赖
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: 安装依赖（版本锁定）
+        run: pip install -r requirements.txt
 
       - name: 拉取每日增量
         env:
@@ -44,5 +41,6 @@ jobs:
             echo "没有数据变更（假期或全部已最新）"
           else
             git commit -m "📈 每日增量 $(TZ=Asia/Shanghai date +%F)"
+            git pull --rebase
             git push
           fi
