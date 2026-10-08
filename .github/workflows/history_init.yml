@@ -1,26 +1,21 @@
 # =====================================================================
-# A股历史数据初始化工作流
-# 触发方式：
-#   1. 手动触发（Run workflow）：默认续传模式；可勾选"覆盖模式"全量重拉
-#   2. 每月第一个周日 北京时间01:00（UTC周六17:00）自动覆盖刷新，
-#      修正前复权数据的漂移
-# 作用：拉取全部A股过去2年前复权日线 → data/history/股票代码.csv
+# A股历史数据初始化工作流（灾备脚本，仅手动触发）
+# 用途：data/history/ 损毁或需从零重建时，手动 Run 本工作流
+#   - 默认续传模式：跳过已下载的股票，只补缺失/失败的
+#   - 勾选 overwrite：全量重拉覆盖（清空重建）
+# 注意：每月的常规全量刷新由 monthly_refresh.yml 负责（全史/看门狗/原子写），
+#   本工作流不再定时触发，避免与月度刷新打架（清空重置回2年深度+全量churn膨胀）
 # =====================================================================
 name: 历史数据初始化
 
 on:
-  # 手动触发，可选覆盖模式
+  # 仅手动触发，可选覆盖模式
   workflow_dispatch:
     inputs:
       overwrite:
         description: '覆盖模式（全量重拉，忽略已有文件）'
         type: boolean
         default: false
-
-  # 每月第一个周日 北京时间01:00 自动覆盖刷新
-  # UTC 周六17:00 = 北京时间周日01:00；日期限制1-7号保证只取第一个周日
-  schedule:
-    - cron: '0 17 1-7 * 6'
 
 # 互斥锁：与每日增量/月度刷新共用同一group，任何数据任务互斥
 concurrency:
@@ -47,29 +42,28 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # 3. 安装依赖（版本锁定在 requirements.txt，保证行为可预测）
+      # 3. 安装依赖（requirements.txt已含akshare，init拉股票清单需要）
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4. 运行历史初始化脚本
-      #    手动触发且勾选覆盖 → FORCE_OVERWRITE=1
-      #    每月定时触发 → 自动覆盖模式
+      # 4. 运行历史初始化脚本（勾选覆盖 → FORCE_OVERWRITE=1）
       - name: 运行历史初始化
         env:
-          FORCE_OVERWRITE: ${{ (github.event_name == 'schedule' || inputs.overwrite == true) && '1' || '0' }}
+          FORCE_OVERWRITE: ${{ inputs.overwrite == true && '1' || '0' }}
         run: python src/fetch_ashare_history_init.py
 
       # 5. 提交数据回仓库
       - name: 提交数据
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/
           if git diff --cached --quiet; then
             echo "本次没有新数据产生，跳过提交"
           else
-            git commit -m "数据更新：历史库 ${{ github.event_name == 'schedule' && '每月覆盖刷新' || '手动初始化' }} $(date '+%Y-%m-%d %H:%M')"
+            git commit -m "数据更新：历史库 ${{ inputs.overwrite == true && '手动覆盖重建' || '手动续传补全' }} $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')"
+            git pull --rebase
             git push
           fi
