@@ -3,12 +3,14 @@
 """
 A股每日增量更新
 ================
-由 .github/workflows/daily.yml 每个交易日自动触发，也可手动 Run。
+由 .github/workflows/daily.yml 每个交易日自动触发（北京时间17:45），也可手动 Run。
 
 流程：
   1. 扫描 data/history/ 下全部存量CSV，记录每只股票的最后日期/收盘价
   2. 主源 baostock 单线程批量查询（只查最近30个自然日，避免全量历史传输）
-  3. baostock 失败/超时的股票 → 新浪 → 腾讯 逐级兜底（5线程并发）
+     —— 双层看门狗：socket默认30秒超时 + 单只120秒硬超时，绝不挂死
+     —— 40分钟总时间预算：超时后剩余股票自动转兜底
+  3. baostock 失败/超时的股票 -> 新浪 -> 腾讯 逐级兜底（5线程并发）
   4. 全部拉完后统一写盘：只追加 date > 存量最后日期 的新行（幂等，重跑不重复）
 
 数据格式（与历史初始化一致）：
@@ -20,6 +22,8 @@ import glob
 import json
 import os
 import re
+import signal
+import socket                 # ★ 看门狗层1
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,7 +39,10 @@ PROGRESS_EVERY = 100       # baostock阶段每100只报一次进度
 FALLBACK_PROGRESS = 500    # 兜底阶段每500只报一次
 THREADS = 5                # 新浪/腾讯兜底并发线程数
 REQ_TIMEOUT = 10           # HTTP超时（秒）
-BS_TIME_BUDGET = 20 * 60   # baostock时间预算（秒）：超时后剩余全部转兜底
+BS_TIME_BUDGET = 40 * 60   # baostock总时间预算40分钟：实测5224只约30分钟，
+                           # 留10分钟余量；超时后剩余全部转兜底，保证总流程不超时
+SOCK_TIMEOUT = 30          # ★ 看门狗层1：socket默认超时（秒）
+PER_STOCK_TIMEOUT = 120    # ★ 看门狗层2：单只股票硬超时（秒），卡死即放弃转兜底
 
 # 成交量单位换算（baostock为股需/100转手；新浪/腾讯接口已是手）
 VOL_DIV_BS = 100
@@ -113,7 +120,7 @@ def build_new_rows(raw_rows, last_date, last_close, vol_div=1):
     返回 (new_rows, status)
       status: "new"(有追加) / "latest"(已含最新) / "none"(停牌/无数据)
     """
-    if not last_date:  # 存量CSV损坏/为空 → 交给月度全量修复
+    if not last_date:  # 存量CSV损坏/为空 -> 交给月度全量修复
         return [], "none"
 
     valid = []
@@ -128,9 +135,9 @@ def build_new_rows(raw_rows, last_date, last_close, vol_div=1):
         return [], "none"
 
     valid.sort(key=lambda r: r[0])
-    if valid[-1][0] < last_date:      # 源里最新日期比存量还早 → 停牌/长期无交易
+    if valid[-1][0] < last_date:      # 源里最新日期比存量还早 -> 停牌/长期无交易
         return [], "none"
-    if valid[-1][0] == last_date:     # 已含源里最新一根 → 已是最新
+    if valid[-1][0] == last_date:     # 已含源里最新一根 -> 已是最新
         return [], "latest"
 
     new = []
@@ -159,6 +166,10 @@ def build_new_rows(raw_rows, last_date, last_close, vol_div=1):
 
 
 # ============================== 主源 baostock ==============================
+def _alarm_handler(signum, frame):
+    raise TimeoutError("per-stock watchdog fired")   # ★ 看门狗层2
+
+
 def baostock_batch(codes, stocks):
     """主源：登录后单线程批量查询，返回 (结果dict, 失败code列表)"""
     result, failed = {}, []
@@ -167,6 +178,10 @@ def baostock_batch(codes, stocks):
     except ImportError:
         print("【baostock】未安装，全部转兜底源")
         return result, list(codes)
+
+    # ★ 看门狗层1：socket默认30秒超时——根治“挂死在无响应的TCP连接上”
+    #   baostock内部新建的连接都会继承此超时，recv卡住30秒即抛异常
+    socket.setdefaulttimeout(SOCK_TIMEOUT)
 
     # 登录（重试3次，间隔5秒）
     ok = False
@@ -181,58 +196,90 @@ def baostock_batch(codes, stocks):
         print(f"【baostock】登录失败({i + 1}/3)，5秒后重试...")
         time.sleep(5)
     if not ok:
-        print("【baostock】❌ 登录失败，全部转兜底源（新浪→腾讯）")
+        print("【baostock】❌ 登录失败，全部转兜底源（新浪->腾讯）")
         return result, list(codes)
 
-    # ★ 核心修复：只查最近30个自然日，不再空日期拉全部历史
+    # ★ 看门狗层2：注册SIGALRM（Actions是Linux，signal.alarm可用）
+    old_handler = None
+    use_alarm = False
+    try:
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        use_alarm = True
+    except (ValueError, AttributeError):
+        pass  # 非主线程/非Unix则只用socket超时保护
+
+    # 只查最近30个自然日，绝不空日期（空=拉全部历史，那是历史教训）
     start = (datetime.now(CST) - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     total = len(codes)
     t0 = time.time()
     print(f"【baostock】✅ 登录成功，单线程批量拉取中"
-          f"（只查近{LOOKBACK_DAYS}天，预计3~5分钟）...")
+          f"（只查近{LOOKBACK_DAYS}天，预计30~40分钟，超时自动转兜底）...")
 
-    for i, code in enumerate(codes, 1):
-        # ★ 时间预算：超时后剩余全部转兜底，绝不无限挂起
-        if time.time() - t0 > BS_TIME_BUDGET:
-            print(f"【baostock】⏰ 时间预算{BS_TIME_BUDGET // 60}分钟已到，"
-                  f"剩余 {total - i + 1} 只转兜底源")
-            failed.extend(codes[i - 1:])
-            break
-        try:
-            rs = bs.query_history_k_data_plus(
-                code_to_bs(code),
-                "date,open,high,low,close,volume,amount,turn",
-                start_date=start, end_date="",
-                frequency="d", adjustflag="2")
-            raw = []
-            while rs.error_code == "0" and rs.next():
-                raw.append(rs.get_row_data())
-            if rs.error_code != "0":
-                raise RuntimeError(rs.error_msg)
-            new, status = build_new_rows(
-                raw, stocks[code]["last_date"], stocks[code]["last_close"],
-                vol_div=VOL_DIV_BS)
-            result[code] = {"rows": new, "status": status, "source": "baostock"}
-        except Exception:
-            failed.append(code)
+    hang_cnt = 0  # ★ 挂死计数（被看门狗打断的只数）
+    try:
+        for i, code in enumerate(codes, 1):
+            # 总时间预算：超时后剩余全部转兜底，绝不无限挂起
+            if time.time() - t0 > BS_TIME_BUDGET:
+                print(f"【baostock】⏰ 时间预算{BS_TIME_BUDGET // 60}分钟已到，"
+                      f"剩余 {total - i + 1} 只转兜底源")
+                failed.extend(codes[i - 1:])
+                break
+            if use_alarm:
+                signal.alarm(PER_STOCK_TIMEOUT)   # ★ 单只硬超时上弦
+            try:
+                rs = bs.query_history_k_data_plus(
+                    code_to_bs(code),
+                    "date,open,high,low,close,volume,amount,turn",
+                    start_date=start, end_date="",
+                    frequency="d", adjustflag="2")
+                raw = []
+                while rs.error_code == "0" and rs.next():
+                    raw.append(rs.get_row_data())
+                if rs.error_code != "0":
+                    raise RuntimeError(rs.error_msg)
+                new, status = build_new_rows(
+                    raw, stocks[code]["last_date"], stocks[code]["last_close"],
+                    vol_div=VOL_DIV_BS)
+                result[code] = {"rows": new, "status": status, "source": "baostock"}
+            except TimeoutError:                  # ★ 看门狗层2触发
+                hang_cnt += 1
+                print(f"【baostock】⚠️ {code} 查询挂死{PER_STOCK_TIMEOUT}s，"
+                      f"放弃转兜底（本运行第{hang_cnt}次）")
+                failed.append(code)
+                # 挂死往往是连接烂了：连续挂死3次 → 直接放弃baostock整体转兜底
+                if hang_cnt >= 3:
+                    print("【baostock】❌ 连续多次挂死，连接疑似已坏，"
+                          f"剩余 {total - i} 只全部转兜底源")
+                    failed.extend(codes[i:])
+                    break
+            except Exception:
+                failed.append(code)
+            finally:
+                if use_alarm:
+                    signal.alarm(0)               # ★ 摘除闹钟
 
-        # ★ 进度：每100只报一次（约13秒一行）
-        if i % PROGRESS_EVERY == 0:
-            el = time.time() - t0
-            print(f"【baostock】进度: {i}/{total}"
-                  f"（成功{len(result)} 失败{len(failed)}，用时{el:.0f}s）")
+            # 进度：每100只报一次
+            if i % PROGRESS_EVERY == 0:
+                el = time.time() - t0
+                print(f"【baostock】进度: {i}/{total}"
+                      f"（成功{len(result)} 失败{len(failed)}，用时{el:.0f}s）")
+    finally:
+        if use_alarm:
+            signal.alarm(0)                       # ★ 离开时确保闹钟已摘
+            signal.signal(signal.SIGALRM, old_handler)  # 恢复原handler
 
     try:
         bs.logout()
     except Exception:
         pass
-    print(f"【baostock】批量完成: 成功 {len(result)}，失败转兜底 {len(failed)}")
+    print(f"【baostock】批量完成: 成功 {len(result)}，失败转兜底 {len(failed)}"
+          f"（其中挂死{hang_cnt}只）")
     return result, failed
 
 
 # ============================== 兜底源 ==============================
 def fetch_sina(code, stocks):
-    """新浪（无成交额/换手率，置空）"""
+    """新浪（无成交额/换手率，置空；由月度全量刷新补齐）"""
     sym = code_to_sym(code)
     url = ("https://quotes.sina.cn/cn/api/jsonp_v2.php/_=/"
            "CN_MarketDataService.getKLineData"
@@ -253,7 +300,7 @@ def fetch_sina(code, stocks):
 
 
 def fetch_tencent(code, stocks):
-    """腾讯（无成交额/换手率，置空）"""
+    """腾讯（无成交额/换手率，置空；由月度全量刷新补齐）"""
     sym = code_to_sym(code)
     url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
            f"?param={sym},day,,,{FETCH_DAYS},qfq")
