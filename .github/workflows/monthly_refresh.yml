@@ -5,13 +5,12 @@ on:
     - cron: '0 10 1 * *'    # 每月1日 UTC 10:00 = 北京时间 18:00
   workflow_dispatch:        # 支持手动触发（断点续跑用）
 
-# 互斥锁：与历史初始化/每日增量共用同一group，避免撞车push冲突
-concurrency:
-  group: ashare-data-pipeline
-  cancel-in-progress: false
-
 permissions:
-  contents: write
+  contents: write           # 脚本内checkpoint提交需要写权限
+
+concurrency:
+  group: ashare-data-pipeline # ★ 与daily共用group，绝不并行
+  cancel-in-progress: false
 
 jobs:
   refresh:
@@ -32,16 +31,17 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 安装依赖
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: 安装依赖（版本锁定）
+        run: pip install -r requirements.txt
 
       - name: 运行月度刷新
+        env:
+          PYTHONUNBUFFERED: '1'   # 2~3小时长任务，日志实时显示
         run: python src/monthly_refresh.py
 
       - name: 收尾提交推送
         run: |
           git add data
           git commit -m "🔄 月度全量刷新 $(TZ=Asia/Shanghai date +%F)" || echo "无变更"
+          git pull --rebase
           git push
