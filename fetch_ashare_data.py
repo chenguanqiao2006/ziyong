@@ -1,8 +1,8 @@
 """
 A股定时拉取脚本，配合 GitHub Actions
+修复：替换交易日历接口，ak.tool_trade_date_hist() 支持2026年节假日
 数据源：akshare
 拉取内容：A股交易日判断、全市场日线、北向资金、龙虎榜
-修复点：确保文件夹创建；异常捕获打印详细错误；非交易日不生成文件
 适配量学建模：后续可扩展量柱计算、量化对倒识别
 """
 import os
@@ -19,9 +19,10 @@ TODAY = datetime.now().strftime("%Y-%m-%d")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 def is_a_stock_trade_day(date_str: str) -> bool:
-    """判断当天是否A股交易日，非交易日直接终止任务"""
+    """判断当天是否A股交易日，使用akshare内置交易日历，支持2026年"""
     try:
-        trade_cal_df = ak.tool_trade_date_hist_sina()
+        # 【重点修改】用 tool_trade_date_hist 替代新浪接口，包含2026节假日
+        trade_cal_df = ak.tool_trade_date_hist()
         return date_str in trade_cal_df["trade_date"].values
     except Exception as e:
         print(f"获取交易日历失败：{e}")
@@ -30,9 +31,14 @@ def is_a_stock_trade_day(date_str: str) -> bool:
 if __name__ == "__main__":
     print(f"===== 开始执行：{TODAY} =====")
 
-    # 非交易日直接退出，不生成任何csv
-    if not is_a_stock_trade_day(TODAY):
-        print("今日不是A股交易日，程序退出，不生成数据文件")
+    trade_flag = is_a_stock_trade_day(TODAY)
+    print(f"交易日历判断结果：{trade_flag}")
+
+    if not trade_flag:
+        print("今日不是A股交易日，程序退出，不生成行情csv")
+        flag_file = os.path.join(DATA_DIR, f"trade_day_flag_{TODAY}.txt")
+        with open(flag_file, "w", encoding="utf-8") as f:
+            f.write(f"{TODAY} 非交易日\n")
         exit(0)
 
     # 1. 拉取全市场A股当日行情日线
