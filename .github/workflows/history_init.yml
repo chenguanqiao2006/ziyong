@@ -1,0 +1,75 @@
+# =====================================================================
+# A股历史数据初始化工作流
+# 触发方式：
+#   1. 手动触发（Run workflow）：默认续传模式；可勾选"覆盖模式"全量重拉
+#   2. 每月第一个周日 北京时间01:00（UTC周六17:00）自动覆盖刷新，
+#      修正前复权数据的漂移
+# 作用：拉取全部A股过去2年前复权日线 → data/history/股票代码.csv
+# =====================================================================
+name: 历史数据初始化
+
+on:
+  # 手动触发，可选覆盖模式
+  workflow_dispatch:
+    inputs:
+      overwrite:
+        description: '覆盖模式（全量重拉，忽略已有文件）'
+        type: boolean
+        default: false
+
+  # 每月第一个周日 北京时间01:00 自动覆盖刷新
+  # UTC 周六17:00 = 北京时间周日01:00；日期限制1-7号保证只取第一个周日
+  schedule:
+    - cron: '0 17 1-7 * 6'
+
+# 互斥锁：数据相关任务同一时间只允许一个实例运行
+concurrency:
+  group: ashare-data-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  history-init:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # GitHub单任务上限6小时，留10分钟余量提交数据
+
+    steps:
+      # 1. 拉取仓库代码
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # 2. 配置Python环境
+      - name: 配置Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # 3. 安装依赖
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install akshare pandas
+
+      # 4. 运行历史初始化脚本
+      #    手动触发且勾选覆盖 → FORCE_OVERWRITE=1
+      #    每月定时触发 → 自动覆盖模式
+      - name: 运行历史初始化
+        env:
+          FORCE_OVERWRITE: ${{ (github.event_name == 'schedule' || inputs.overwrite == true) && '1' || '0' }}
+        run: python src/fetch_ashare_history_init.py
+
+      # 5. 提交数据回仓库
+      - name: 提交数据
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "本次没有新数据产生，跳过提交"
+          else
+            git commit -m "数据更新：历史库 ${{ github.event_name == 'schedule' && '每月覆盖刷新' || '手动初始化' }} $(date '+%Y-%m-%d %H:%M')"
+            git push
+          fi
