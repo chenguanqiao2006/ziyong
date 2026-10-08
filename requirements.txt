@@ -2,3 +2,4 @@
 # 升级akshare时：手动改版本号，并建议先手动触发一次任务验证无报错
 akshare==1.19.1
 pandas==2.2.3
+baostock==0.8.9
