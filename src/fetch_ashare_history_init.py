@@ -8,9 +8,10 @@ A股历史数据初始化脚本
 5. 附赠：北向资金全部历史一次性存档
 6. 收尾打印数据目录体积（监控仓库膨胀）
 
-路径说明：
-  本脚本位于 src/ 目录，通过自身文件位置定位仓库根目录，
-  无论从哪里运行（Actions / 本地任意路径），data 目录都指向正确的位置。
+股票清单多数据源降级（2026-10-08修复）：
+  GitHub Actions 服务器在美国，东财实时行情接口会拒绝海外数据中心IP，
+  故清单获取改为三级降级：东财 → 沪深交易所官网 → 新浪
+  （个股历史接口 stock_zh_a_hist 走东财另一个域名，通常不受此限制）
 
 复权说明：
   adjust="qfq" 前复权——历史价格已按分红除权调整，K线连续无假跳空。
@@ -22,9 +23,8 @@ import akshare as ak
 from datetime import datetime, timedelta
 
 # ===================== 路径定位（关键：基于脚本自身位置） =====================
-# 本文件在 <仓库根>/src/ 下，往上一层就是仓库根目录
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HISTORY_DIR = os.path.join(PROJECT_ROOT, "data", "history")  # 历史数据保存目录
+HISTORY_DIR = os.path.join(PROJECT_ROOT, "data", "history")
 # ============================================================================
 
 # ===================== 可配置参数区 =====================
@@ -62,19 +62,53 @@ def fetch_stock_history(code: str):
     return df
 
 
+def dedup_codes(codes) -> list:
+    """代码去重并排序"""
+    return sorted(set(str(c).zfill(6) for c in codes))
+
+
 def get_all_stock_codes():
-    """获取全市场A股股票代码清单（东财源）"""
+    """
+    获取全市场A股股票代码清单 —— 三级数据源降级：
+    ① 东财实时行情（最全，含北交所，但海外IP常被拦）
+    ② 沪深交易所官网（对海外IP友好，不含北交所）
+    ③ 新浪实时行情（慢但通用，含北交所）
+    """
     print("【股票清单】正在获取全市场A股代码...")
-    for i in range(RETRY_TIMES + 1):
+
+    # ---- 数据源①：东财 ----
+    for i in range(2):
         try:
             df = ak.stock_zh_a_spot_em()
-            codes = df["代码"].astype(str).tolist()
-            print(f"【股票清单】获取成功，共 {len(codes)} 只股票")
+            codes = dedup_codes(df["代码"].tolist())
+            print(f"【股票清单】✅ 数据源①（东财）获取成功，共 {len(codes)} 只")
             return codes
         except Exception as e:
-            print(f"【股票清单】第{i+1}次失败：{e}")
-            time.sleep(3)
-    print("【股票清单】❌ 获取失败，无法继续！")
+            print(f"【股票清单】数据源①（东财）第{i+1}次失败：{e}")
+            time.sleep(5)
+
+    # ---- 数据源②：沪深交易所官网 ----
+    try:
+        print("【股票清单】东财源不可用，切换数据源②（交易所官网）...")
+        df = ak.stock_info_a_code_name()
+        codes = dedup_codes(df["code"].tolist())
+        print(f"【股票清单】✅ 数据源②（交易所官网）获取成功，共 {len(codes)} 只")
+        return codes
+    except Exception as e:
+        print(f"【股票清单】数据源②（交易所官网）失败：{e}")
+        time.sleep(5)
+
+    # ---- 数据源③：新浪 ----
+    try:
+        print("【股票清单】交易所官网也不可用，切换数据源③（新浪）...")
+        df = ak.stock_zh_a_spot()
+        codes = dedup_codes(df["代码"].tolist())
+        print(f"【股票清单】✅ 数据源③（新浪）获取成功，共 {len(codes)} 只")
+        return codes
+    except Exception as e:
+        print(f"【股票清单】数据源③（新浪）失败：{e}")
+
+    print("【股票清单】❌ 三个数据源全部失败，无法继续！")
     return None
 
 
