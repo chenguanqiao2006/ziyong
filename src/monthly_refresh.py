@@ -6,19 +6,24 @@ A股月度全量刷新
 由 .github/workflows/monthly_refresh.yml 每月1日自动触发，也可手动 Run。
 
 用途（与每日增量互补）：
-  1. 用 baostock 重拉每只股票【上市以来全部】前复权日线，整文件覆盖重写
+  1. 用 baostock 重拉每只股票近 KEEP_YEARS 年（本库=2年）前复权日线，整文件覆盖重写
      → 补齐新浪/腾讯兜底留下的空字段（amount / turnover / pct_chg）
-     → 修正除权除息后的复权基准（前复权数据在除权后整个历史都会重算，
-        所以必须全量重写，不能只刷最近一段）
+     → 修正除权除息后的复权基准（前复权价格锚定最新价，除权后近2年整段都会重算，
+        所以每次都整文件重写，不能只刷最近一段）
   2. 全量股票清单与存量比对，自动收编新股建档
-  3. 退市股查询返回空 → 文件保持原样不动（历史仍有分析价值）
+  3. 退市/长期停牌股查询返回空 → 文件保持原样不动
+
+为什么可以只查近2年（而不用拉全史）：
+  前复权的调整基准是"最新价"，由 baostock 服务端按除权事件计算，与查询窗口无关。
+  任意窗口查出的同一日期复权价完全一致（本库数据就是这么建出来的：init拉2年、
+  daily拉30天，两边追加的行字节级吻合即是证明）。故 KEEP_YEARS 模式下查询窗口
+  收窄到近2年+15天缓冲，拉取量与init同量级 → 月度刷新从2~3.5小时降到约15~40分钟。
 
 仓库体积控制（重要）：
-  - 输出与每日增量字节级一致（同样的格式化、官方pctChg、停牌跳过口径），
-    未发生除权事件的股票重写后 diff 为零 → git不膨胀
-  - 真正的体积增长只来自"确实变了"的数据（除权股重算+新股），
-    分红季（5~7月）会大一些，属必要成本
-  - KEEP_YEARS 可选：设为整数N则只保留近N年（进一步控体积），None=全部保留
+  - KEEP_YEARS=2：自用策略99%参数周期≤250日，2年（约490根K线）足够；
+    全史方案除权churn每年+400~500MB（分红季2000+只重算全史），2年方案锁定~80MB/年
+  - 输出与每日增量字节级一致（官方pctChg、volume股转手、停牌跳过口径），
+    未除权股票重写后 diff 为零 → git不膨胀；除权股重写属必要成本
   - 文件统一 utf-8-sig（带BOM），Excel直接打开不乱码；读取端utf-8-sig兼容新旧
 
 安全设计：
@@ -27,7 +32,7 @@ A股月度全量刷新
   - 原子写盘：临时文件 + os.replace，中途挂掉不会留半截文件
   - 每2000只 git checkpoint 提交一次，防长时间运行后意外丢进度
 
-预计耗时：5224只 × 全量历史 ≈ 2~3.5小时（数据量是每日增量的百倍级，正常）
+预计耗时：KEEP_YEARS=2 时约 15~40 分钟（None全史模式约 2~3.5 小时）
 """
 
 import csv
@@ -45,11 +50,16 @@ import baostock as bs
 # ============================== 配置 ==============================
 PROGRESS_EVERY = 100      # 每100只报一次进度
 CHECKPOINT_EVERY = 2000   # 每2000只 git checkpoint 提交一次
-TIME_BUDGET = 240 * 60    # 时间预算4小时（Actions单job上限6小时，留收尾余量）
+TIME_BUDGET = 240 * 60    # 时间预算4小时上限（KEEP_YEARS=2实际15~40分钟；
+                          # None全史2~3.5小时。Actions单job上限6小时，留收尾余量）
 SOCK_TIMEOUT = 30         # 看门狗层1：socket默认超时（秒），防挂死
-PER_STOCK_TIMEOUT = 180   # 看门狗层2：单只硬超时（秒）——月度拉全量历史，宽限些
+PER_STOCK_TIMEOUT = 180   # 看门狗层2：单只硬超时（秒）
 LOGIN_RETRY = 3
-KEEP_YEARS = None         # None=保留上市以来全部；设为整数N则只保留近N年（控体积）
+KEEP_YEARS = 2            # 只保留近N年（自用库推荐2年：控体积+提速）。
+                          # 改回 None = 上市以来全部（仓库将达GB级，
+                          # 且分红季每年+400~500MB churn，慎用）
+QUERY_BUFFER_DAYS = 15    # KEEP_YEARS模式查询窗口额外前推天数（缓冲行写入前丢弃，
+                          # 作用是让cutoff附近首行的官方pctChg有前收盘可依）
 CST = timezone(timedelta(hours=8))  # 北京时间
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -78,6 +88,21 @@ def _fmt(x, nd=2):
         return ""
 
 
+def keep_window() -> tuple:
+    """
+    KEEP_YEARS 模式：返回 (start_date, cutoff)
+      start_date = N年前再前推15天（查询缓冲，保证cutoff附近首行pctChg有效）
+      cutoff     = N年前（写入时只保留此日期之后的行，缓冲行丢弃）
+    None 模式：返回 ("", "")，即查询上市以来全部历史
+    """
+    if not KEEP_YEARS:
+        return "", ""
+    now = datetime.now(CST)
+    cutoff = (now - timedelta(days=365 * KEEP_YEARS)).strftime("%Y-%m-%d")
+    start = (now - timedelta(days=365 * KEEP_YEARS + QUERY_BUFFER_DAYS)).strftime("%Y-%m-%d")
+    return start, cutoff
+
+
 # ============================== 看门狗 ==============================
 def _alarm_handler(signum, frame):
     raise TimeoutError("per-stock watchdog fired")
@@ -102,14 +127,15 @@ def get_all_stocks() -> set:
 # ============================== 单只刷新 ==============================
 def refresh_one(code: str) -> int:
     """
-    重拉单只股票全部历史（前复权），整文件原子覆盖重写。
-    返回写入的K线根数；无数据（长期停牌/退市/源不覆盖）返回0且不动文件。
+    重拉单只股票近KEEP_YEARS年前复权日线（None=上市以来全部），整文件原子覆盖重写。
+    返回写入的K线根数；无数据（退市/长期停牌/源不覆盖）返回0且不动文件。
     行格式与每日增量字节级一致（官方pctChg、volume股转手、停牌日跳过）。
     """
+    start, cutoff = keep_window()
     rs = bs.query_history_k_data_plus(
         code_to_bs(code),
         "date,open,high,low,close,volume,amount,pctChg,turn",
-        start_date="", end_date="",          # ★ 故意全量：前复权基准需整体重算
+        start_date=start, end_date="",
         frequency="d", adjustflag="2")
     if rs.error_code != "0":
         raise RuntimeError(rs.error_msg)
@@ -129,15 +155,14 @@ def refresh_one(code: str) -> int:
     if not rows:
         return 0
 
-    if KEEP_YEARS:   # 可选：只保留近N年，控制仓库体积
-        cutoff = (datetime.now(CST) - timedelta(days=365 * KEEP_YEARS)).strftime("%Y-%m-%d")
+    if cutoff:   # 丢弃缓冲区行，只保留近N年
         rows = [r for r in rows if r[0] >= cutoff]
         if not rows:
             return 0
 
     path = os.path.join(HIST_DIR, code + ".csv")
     tmp = path + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:   # 与init统一带BOM
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:   # 带BOM，Excel不乱码
         w = csv.writer(f)
         w.writerow(CSV_HEADER)
         w.writerows(rows)
@@ -170,6 +195,7 @@ def main():
 
     print("=" * 60)
     print(f"===== A股月度全量刷新开始（北京时间 {now:%Y-%m-%d %H:%M}） =====")
+    print(f"===== 数据深度：{'近%d年' % KEEP_YEARS if KEEP_YEARS else '上市以来全部'} =====")
     print("=" * 60)
 
     # ---------- 看门狗层1：socket默认超时（防挂死） ----------
