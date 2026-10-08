@@ -1,0 +1,39 @@
+name: 月度全量刷新
+
+on:
+  schedule:
+    - cron: '0 10 1 * *'    # 每月1日 UTC 10:00 = 北京时间 18:00
+  workflow_dispatch:        # 支持手动触发（断点续跑用）
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300    # 5小时硬上限（Actions单job上限6小时）
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 配置git身份（脚本内checkpoint提交要用）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 安装Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install baostock
+
+      - name: 运行月度刷新
+        run: python src/monthly_refresh.py
+
+      - name: 收尾提交推送
+        run: |
+          git add data
+          git commit -m "🔄 月度全量刷新 $(TZ=Asia/Shanghai date +%F)" || echo "无变更"
+          git push
