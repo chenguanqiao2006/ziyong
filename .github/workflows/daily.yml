@@ -8,23 +8,27 @@ on:
 permissions:
   contents: write             # 允许 bot 推送数据提交
 
+# 互斥锁：与历史初始化/月度刷新共用同一group，任何数据任务互斥
 concurrency:
-  group: daily-update
-  cancel-in-progress: false   # 与手动Run撞车时排队，不互相打断
+  group: ashare-data-pipeline
+  cancel-in-progress: false
 
 jobs:
   daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 55       # 留5分钟余量，防止撞60分钟硬上限导致无日志
+    timeout-minutes: 90       # baostock预算40分钟+兜底+写盘，留足余量
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: 安装依赖
-        run: pip install pandas requests baostock
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: 拉取每日增量
         env:
