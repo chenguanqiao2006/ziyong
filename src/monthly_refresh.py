@@ -19,6 +19,8 @@ A股月度全量刷新
   - 原子写盘：临时文件 + os.replace，中途挂掉不会留半截文件
   - 每2000只 git checkpoint 提交一次，防长时间运行后意外丢进度
 
+编码：utf-8-sig（带BOM，Excel打开不乱码），与 init / daily_append 统一
+
 预计耗时：5224只 × 全量历史 ≈ 2~3.5小时（数据量是每日增量的百倍级，正常）
 """
 
@@ -121,7 +123,7 @@ def refresh_one(code: str) -> int:
 
     path = os.path.join(HIST_DIR, code + ".csv")
     tmp = path + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:   # ★ utf-8-sig 统一
         w = csv.writer(f)
         w.writerow(CSV_HEADER)
         w.writerows(rows)
