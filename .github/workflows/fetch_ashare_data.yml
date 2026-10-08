@@ -33,6 +33,11 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add ./data/*.csv
-          git commit -m "🤖 自动更新A股行情数据 $(date +'%Y-%m-%d')" || echo "无新数据，无需提交"
-          git push
+          # 判断是否存在csv文件，有文件才add，没有直接跳过
+          if [ -n "$(ls ./data/*.csv 2>/dev/null)" ]; then
+            git add ./data/*.csv
+            git commit -m "🤖 自动更新A股行情数据 $(date +'%Y-%m-%d')"
+            git push
+          else
+            echo "✅ data目录下没有新csv文件，跳过git提交"
+          fi
