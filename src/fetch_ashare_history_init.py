@@ -1,5 +1,5 @@
 """
-A股历史数据初始化脚本（baostock主源·双轮版 v7，2026-10-08）
+A股历史数据初始化脚本（baostock主源·双轮版 v8，2026-10-09）
 架构（借鉴用户旧脚本 fetch_quotes.py 的成熟经验）：
   第一轮（主源）：baostock 单线程批量拉取
     - 免费、无需注册、无限流，走私有协议不受海外IP拦截影响
@@ -12,11 +12,16 @@ A股历史数据初始化脚本（baostock主源·双轮版 v7，2026-10-08）
 保持不变：
 - 输出：data/history/股票代码.csv，9列
   date/open/close/high/low/volume/amount/pct_chg/turnover
-- 断点续传、覆盖模式(FORCE_OVERWRITE=1)、北交所剔除、北向资金存档、体积监控
+- 断点续传、覆盖模式(FORCE_OVERWRITE=1)、北交所剔除、体积监控
 
 v7修复：股票清单筛选逻辑bug——v6中北交所规范化返回(None,None)元组，
   旧写法filter(None,...)无法过滤元组导致排序报错
   'NoneType' and 'str'，改用集合推导式 if c 显式剔除。
+
+v8变更（2026-10-09）：
+- 删除北向资金拉取：stock_hsgt_hist_em 自 2024-08-19 起不再产出新数据，
+  接口返回停在 2024-08-19，留着只会误导和浪费一次 API 调用
+- 编码保持 utf-8-sig（与 monthly_refresh / daily_append 统一）
 """
 import os
 import re
@@ -261,7 +266,7 @@ def get_all_stock_codes():
     """返回 [(纯代码, 带前缀代码), ...]。降级：东财→交易所官网→新浪"""
 
     def to_pairs(df, col):
-        """★v7修复★ 先规范化出(代码,前缀代码)，再 if c 剔除北交所的(None,None)"""
+        """先规范化出(代码,前缀代码)，再 if c 剔除北交所的(None,None)"""
         return sorted({(c, s) for c, s in (normalize_symbol(x) for x in df[col].tolist()) if c})
 
     import akshare as ak
@@ -299,22 +304,7 @@ def get_all_stock_codes():
     return None
 
 
-# ===================== 北向资金 / 工具 =====================
-def save_north_fund_history():
-    import akshare as ak
-    print("\n【北向资金】正在拉取全部历史...")
-    try:
-        df = ak.stock_hsgt_hist_em(symbol="北向资金")
-        if df is not None and len(df) > 0:
-            save_path = os.path.join(HISTORY_DIR, "north_fund_ALL_HISTORY.csv")
-            df.to_csv(save_path, index=False, encoding="utf-8-sig")
-            print(f"【北向资金】✅ 历史存档保存成功：{save_path}，共 {len(df)} 条")
-        else:
-            print("【北向资金】⚠️ 接口返回空数据，跳过")
-    except Exception as e:
-        print(f"【北向资金】拉取失败（不影响股票下载）：{e}")
-
-
+# ===================== 工具 =====================
 def get_dir_size_mb(path):
     total = 0
     for root, _, files in os.walk(path):
@@ -330,7 +320,7 @@ def clean_overwrite_dir():
     print("【覆盖模式】检测到 FORCE_OVERWRITE=1，将全量重拉覆盖旧数据...")
     removed = 0
     for f in os.listdir(HISTORY_DIR):
-        if f.endswith(".csv") and f != "north_fund_ALL_HISTORY.csv":
+        if f.endswith(".csv"):
             os.remove(os.path.join(HISTORY_DIR, f))
             removed += 1
     print(f"【覆盖模式】已清空旧股票文件 {removed} 个，开始全量重拉")
@@ -339,7 +329,7 @@ def clean_overwrite_dir():
 # ===================== 主流程 =====================
 if __name__ == "__main__":
     print("=" * 60)
-    print("===== A股历史数据初始化开始（baostock主源·双轮版） =====")
+    print("===== A股历史数据初始化开始（baostock主源·双轮版 v8） =====")
     print(f"===== 当前时间：{now} =====")
     print(f"===== 拉取范围：{HISTORY_YEARS} 年（{START_DATE_BS.replace('-', '')} ~ {END_DATE_BS.replace('-', '')}）=====")
     print(f"===== 复权方式：前复权（qfq）=====")
@@ -356,7 +346,7 @@ if __name__ == "__main__":
 
     already = set()
     for f in os.listdir(HISTORY_DIR):
-        if f.endswith(".csv") and f != "north_fund_ALL_HISTORY.csv":
+        if f.endswith(".csv"):
             already.add(f.replace(".csv", ""))
     todo_pairs = [(c, s) for c, s in all_pairs if c not in already]
 
@@ -424,8 +414,6 @@ if __name__ == "__main__":
                           f"成功{success_count} 空{empty_count} 败{len(fail_list)}")
     else:
         print("\n【第二轮】baostock 全部成功，无需补拉 🎉")
-
-    save_north_fund_history()
 
     total_time = round((time.time() - start_time) / 60, 1)
     dir_size = get_dir_size_mb(os.path.join(PROJECT_ROOT, "data"))
