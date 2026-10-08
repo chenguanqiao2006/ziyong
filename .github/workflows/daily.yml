@@ -1,0 +1,36 @@
+name: 每日增量
+on:
+  schedule:
+    - cron: '30 8 * * 1-5'   # 北京时间周一~五 16:30（收盘后）
+  workflow_dispatch:
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install pandas requests baostock
+
+      - name: 拉取每日增量
+        env:
+          PYTHONUNBUFFERED: '1'   # 日志实时显示，不再憋缓冲
+        run: python src/daily_append.py
+
+      - name: 提交数据
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "没有数据变更（假期或全部已最新）"
+          else
+            git commit -m "📈 每日增量 $(date -u +%Y-%m-%d)"
+            git push
+          fi
