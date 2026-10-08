@@ -22,7 +22,7 @@ on:
   schedule:
     - cron: '0 17 1-7 * 6'
 
-# 互斥锁：数据相关任务同一时间只允许一个实例运行
+# 互斥锁：与每日增量/月度刷新共用同一group，任何数据任务互斥
 concurrency:
   group: ashare-data-pipeline
   cancel-in-progress: false
@@ -33,7 +33,7 @@ permissions:
 jobs:
   history-init:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # GitHub单任务上限6小时，留10分钟余量提交数据
+    timeout-minutes: 120   # 脚本实际约15-30分钟；120分钟仅作异常兜底
 
     steps:
       # 1. 拉取仓库代码
