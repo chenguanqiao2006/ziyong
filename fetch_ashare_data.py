@@ -1,11 +1,10 @@
 """
 A股定时拉取脚本，配合 GitHub Actions
 更新：
-1. 更换akshare兼容旧版本接口名称
-2. 增加网络重试、sleep延时，缓解网络被断开
-3. 本地内置2026休市清单，时区已在workflow设置Asia/Shanghai
+1. 龙虎榜增加异常隔离，接口不存在也不会导致整个程序崩溃
+2. 保留全市场行情、北向资金拉取
+3. 带网络重试，本地内置2026休市清单，时区已在workflow设置Asia/Shanghai
 数据源：akshare
-拉取内容：A股全市场当日行情、北向资金、龙虎榜
 适配量学建模：后续可扩展量柱计算、量化对倒识别
 """
 import os
@@ -107,25 +106,31 @@ if __name__ == "__main__":
             f.write(f"{TODAY} 非交易日\n")
         exit(0)
 
-    # 1. 全市场A股当日行情（改用兼容接口 ak.stock_zh_a_spot）
+    # 1. 全市场A股当日行情
     print("正在拉取全市场A股日线行情...")
     df_spot = fetch_with_retry(ak.stock_zh_a_spot, "全市场行情")
     if df_spot is not None and len(df_spot) > 0:
         df_spot.to_csv(f"{DATA_DIR}/ashare_spot_{TODAY}.csv", index=False, encoding="utf-8-sig")
         print(f"日线行情保存成功，共 {len(df_spot)} 条")
 
-    # 2. 北向资金（旧版akshare可用接口）
+    # 2. 北向资金
     print("正在拉取北向资金数据...")
     df_north = fetch_with_retry(ak.stock_hsgt_hist_em, "北向资金")
     if df_north is not None and len(df_north) > 0:
         df_north.to_csv(f"{DATA_DIR}/north_fund_{TODAY}.csv", index=False, encoding="utf-8-sig")
         print("北向资金保存成功")
 
-    # 3. 龙虎榜（旧版akshare兼容接口 ak.stock_lhb）
+    # 3. 龙虎榜：单独捕获异常，接口不存在也不会中断整个脚本
     print("正在拉取龙虎榜数据...")
-    df_lhb = fetch_with_retry(ak.stock_lhb, "龙虎榜", date=TODAY)
-    if df_lhb is not None and len(df_lhb) > 0:
-        df_lhb.to_csv(f"{DATA_DIR}/longhubang_{TODAY}.csv", index=False, encoding="utf-8-sig")
-        print(f"龙虎榜保存成功，共 {len(df_lhb)} 条")
+    try:
+        # 旧版本akshare没有stock_lhb，这里直接捕获AttributeError
+        df_lhb = fetch_with_retry(ak.stock_lhb, "龙虎榜", date=TODAY)
+        if df_lhb is not None and len(df_lhb) > 0:
+            df_lhb.to_csv(f"{DATA_DIR}/longhubang_{TODAY}.csv", index=False, encoding="utf-8-sig")
+            print(f"龙虎榜保存成功，共 {len(df_lhb)} 条")
+    except AttributeError as e:
+        print(f"【龙虎榜】akshare无此接口，跳过龙虎榜拉取，不中断任务：{e}")
+    except Exception as e:
+        print(f"【龙虎榜】拉取异常，跳过龙虎榜：{e}")
 
     print("===== 数据拉取任务完成 =====")
