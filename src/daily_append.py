@@ -15,6 +15,12 @@ A股每日增量更新
 
 数据格式（与历史初始化一致）：
   date,open,close,high,low,volume(手),amount(元),pct_chg(%),turnover(%)
+
+v2变更（2026-10-09）：
+- 修复新浪 volume 单位错误：新浪返回"股"，原脚本 vol_div=1 导致追加时
+  数值是存量数据的 100 倍，改为 VOL_DIV_SINA=100（与 init / monthly 对齐）
+- 读取 CSV 显式指定 utf-8-sig（自动兼容带/不带BOM）
+- 追加写入保持 utf-8（不加 BOM 到文件中段）
 """
 
 import csv
@@ -44,9 +50,12 @@ BS_TIME_BUDGET = 40 * 60   # baostock总时间预算40分钟：实测5224只约3
 SOCK_TIMEOUT = 30          # ★ 看门狗层1：socket默认超时（秒）
 PER_STOCK_TIMEOUT = 120    # ★ 看门狗层2：单只股票硬超时（秒），卡死即放弃转兜底
 
-# 成交量单位换算（baostock为股需/100转手；新浪/腾讯接口已是手）
+# 成交量单位换算
+#   baostock：返回"股"，需 /100 转"手"
+#   新浪    ：返回"股"，需 /100 转"手"（v2修复，原为1导致数据放大100倍）
+#   腾讯    ：返回"手"，保持1
 VOL_DIV_BS = 100
-VOL_DIV_SINA = 1
+VOL_DIV_SINA = 100
 VOL_DIV_TX = 1
 
 CST = timezone(timedelta(hours=8))  # 北京时间
@@ -102,7 +111,8 @@ def scan_existing() -> dict:
         code = os.path.splitext(os.path.basename(path))[0]
         info = {"path": path, "last_date": "", "last_close": ""}
         try:
-            df = pd.read_csv(path, dtype=str)
+            # 显式 utf-8-sig：自动兼容带/不带 BOM 两种文件
+            df = pd.read_csv(path, dtype=str, encoding="utf-8-sig")
             if not df.empty and "date" in df.columns and str(df.iloc[-1]["date"]).strip():
                 info["last_date"] = str(df.iloc[-1]["date"]).strip()
                 info["last_close"] = str(df.iloc[-1].get("close", "")).strip()
@@ -116,7 +126,7 @@ def scan_existing() -> dict:
 def build_new_rows(raw_rows, last_date, last_close, vol_div=1):
     """
     raw_rows: [(date, open, high, low, close, volume, amount, turn)]
-    vol_div: 成交量除数（baostock传100，新浪/腾讯传1）
+    vol_div: 成交量除数（baostock传100，新浪传100，腾讯传1）
     返回 (new_rows, status)
       status: "new"(有追加) / "latest"(已含最新) / "none"(停牌/无数据)
     """
@@ -179,7 +189,7 @@ def baostock_batch(codes, stocks):
         print("【baostock】未安装，全部转兜底源")
         return result, list(codes)
 
-    # ★ 看门狗层1：socket默认30秒超时——根治“挂死在无响应的TCP连接上”
+    # ★ 看门狗层1：socket默认30秒超时——根治"挂死在无响应的TCP连接上"
     #   baostock内部新建的连接都会继承此超时，recv卡住30秒即抛异常
     socket.setdefaulttimeout(SOCK_TIMEOUT)
 
@@ -279,7 +289,8 @@ def baostock_batch(codes, stocks):
 
 # ============================== 兜底源 ==============================
 def fetch_sina(code, stocks):
-    """新浪（无成交额/换手率，置空；由月度全量刷新补齐）"""
+    """新浪（无成交额/换手率，置空；由月度全量刷新补齐）
+    注意：新浪 volume 单位是"股"，需 /100 转"手"（v2修复）"""
     sym = code_to_sym(code)
     url = ("https://quotes.sina.cn/cn/api/jsonp_v2.php/_=/"
            "CN_MarketDataService.getKLineData"
@@ -300,7 +311,8 @@ def fetch_sina(code, stocks):
 
 
 def fetch_tencent(code, stocks):
-    """腾讯（无成交额/换手率，置空；由月度全量刷新补齐）"""
+    """腾讯（无成交额/换手率，置空；由月度全量刷新补齐）
+    腾讯 qfqday 的 volume 已是"手"，vol_div=1"""
     sym = code_to_sym(code)
     url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
            f"?param={sym},day,,,{FETCH_DAYS},qfq")
@@ -341,7 +353,11 @@ def run_fallback(codes, stocks, fetcher, name):
 
 # ============================== 写盘 ==============================
 def append_to_csv(info, rows):
-    """把新行追加到CSV末尾（调用前已保证 date > 存量最后日期，不重不漏）"""
+    """把新行追加到CSV末尾（调用前已保证 date > 存量最后日期，不重不漏）
+
+    编码注意：文件本身带 BOM（utf-8-sig 写入），追加时用 utf-8（不加BOM），
+    否则 BOM 会重复插入到文件中段导致解析异常。
+    """
     with open(info["path"], "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         for r in rows:
