@@ -13,13 +13,19 @@ A股月度全量刷新
   2. 全量股票清单与存量比对，自动收编新股建档
   3. 退市股查询返回空 → 文件保持原样不动（历史仍有分析价值）
 
+仓库体积控制（重要）：
+  - 输出与每日增量字节级一致（同样的格式化、官方pctChg、停牌跳过口径），
+    未发生除权事件的股票重写后 diff 为零 → git不膨胀
+  - 真正的体积增长只来自"确实变了"的数据（除权股重算+新股），
+    分红季（5~7月）会大一些，属必要成本
+  - KEEP_YEARS 可选：设为整数N则只保留近N年（进一步控体积），None=全部保留
+  - 文件统一 utf-8-sig（带BOM），Excel直接打开不乱码；读取端utf-8-sig兼容新旧
+
 安全设计：
   - 双层看门狗：socket默认30秒超时 + 单只180秒硬超时（SIGALRM），绝不挂死
   - 断点续跑：每成功一只记入 data/.monthly_refresh_<年-月>.done，中断重Run即续
   - 原子写盘：临时文件 + os.replace，中途挂掉不会留半截文件
   - 每2000只 git checkpoint 提交一次，防长时间运行后意外丢进度
-
-编码：utf-8-sig（带BOM，Excel打开不乱码），与 init / daily_append 统一
 
 预计耗时：5224只 × 全量历史 ≈ 2~3.5小时（数据量是每日增量的百倍级，正常）
 """
@@ -43,6 +49,7 @@ TIME_BUDGET = 240 * 60    # 时间预算4小时（Actions单job上限6小时，�
 SOCK_TIMEOUT = 30         # 看门狗层1：socket默认超时（秒），防挂死
 PER_STOCK_TIMEOUT = 180   # 看门狗层2：单只硬超时（秒）——月度拉全量历史，宽限些
 LOGIN_RETRY = 3
+KEEP_YEARS = None         # None=保留上市以来全部；设为整数N则只保留近N年（控体积）
 CST = timezone(timedelta(hours=8))  # 北京时间
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -97,6 +104,7 @@ def refresh_one(code: str) -> int:
     """
     重拉单只股票全部历史（前复权），整文件原子覆盖重写。
     返回写入的K线根数；无数据（长期停牌/退市/源不覆盖）返回0且不动文件。
+    行格式与每日增量字节级一致（官方pctChg、volume股转手、停牌日跳过）。
     """
     rs = bs.query_history_k_data_plus(
         code_to_bs(code),
@@ -121,9 +129,15 @@ def refresh_one(code: str) -> int:
     if not rows:
         return 0
 
+    if KEEP_YEARS:   # 可选：只保留近N年，控制仓库体积
+        cutoff = (datetime.now(CST) - timedelta(days=365 * KEEP_YEARS)).strftime("%Y-%m-%d")
+        rows = [r for r in rows if r[0] >= cutoff]
+        if not rows:
+            return 0
+
     path = os.path.join(HIST_DIR, code + ".csv")
     tmp = path + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:   # ★ utf-8-sig 统一
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:   # 与init统一带BOM
         w = csv.writer(f)
         w.writerow(CSV_HEADER)
         w.writerows(rows)
@@ -140,6 +154,8 @@ def checkpoint_commit(msg: str):
         r = subprocess.run(["git", "commit", "-m", msg], cwd=ROOT,
                            capture_output=True, text=True)
         if r.returncode == 0:
+            subprocess.run(["git", "pull", "--rebase"], cwd=ROOT,
+                           capture_output=True, timeout=120)
             subprocess.run(["git", "push"], cwd=ROOT,
                            capture_output=True, timeout=120)
     except Exception as e:
