@@ -16,6 +16,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      # ========== 新增：设置系统时区为上海（北京时间） ==========
+      - name: 设置时区为Asia/Shanghai
+        run: |
+          sudo timedatectl set-timezone Asia/Shanghai
+          echo "TZ=Asia/Shanghai" >> $GITHUB_ENV
+
       - name: 设置Python环境
         uses: actions/setup-python@v5
         with:
