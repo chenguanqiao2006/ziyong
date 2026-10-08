@@ -1,11 +1,11 @@
 """
 A股定时拉取脚本，配合 GitHub Actions
 更新：
-1. 龙虎榜增加异常隔离，接口不存在也不会导致整个程序崩溃
-2. 保留全市场行情、北向资金拉取
-3. 带网络重试，本地内置2026休市清单，时区已在workflow设置Asia/Shanghai
+1. 龙虎榜更换新浪源接口 stock_lhb_detail_daily_sina
+2. 全市场行情、北向资金保持原有稳定逻辑
+3. 单独捕获异常，接口不存在也不会中断整个脚本
 数据源：akshare
-适配量学建模：后续可扩展量柱计算、量化对倒识别
+适配量学建模：后续可扩展量柱、量比、位置判断、量化对倒识别
 """
 import os
 import time
@@ -120,16 +120,15 @@ if __name__ == "__main__":
         df_north.to_csv(f"{DATA_DIR}/north_fund_{TODAY}.csv", index=False, encoding="utf-8-sig")
         print("北向资金保存成功")
 
-    # 3. 龙虎榜：单独捕获异常，接口不存在也不会中断整个脚本
+    # 3. 龙虎榜：新浪源接口 stock_lhb_detail_daily_sina
     print("正在拉取龙虎榜数据...")
     try:
-        # 旧版本akshare没有stock_lhb，这里直接捕获AttributeError
-        df_lhb = fetch_with_retry(ak.stock_lhb, "龙虎榜", date=TODAY)
+        df_lhb = fetch_with_retry(ak.stock_lhb_detail_daily_sina, "龙虎榜", date=TODAY)
         if df_lhb is not None and len(df_lhb) > 0:
             df_lhb.to_csv(f"{DATA_DIR}/longhubang_{TODAY}.csv", index=False, encoding="utf-8-sig")
             print(f"龙虎榜保存成功，共 {len(df_lhb)} 条")
     except AttributeError as e:
-        print(f"【龙虎榜】akshare无此接口，跳过龙虎榜拉取，不中断任务：{e}")
+        print(f"【龙虎榜】akshare无stock_lhb_detail_daily_sina接口，跳过龙虎榜拉取，不中断任务：{e}")
     except Exception as e:
         print(f"【龙虎榜】拉取异常，跳过龙虎榜：{e}")
 
