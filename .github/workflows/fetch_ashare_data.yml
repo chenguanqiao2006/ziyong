@@ -42,11 +42,11 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # 3. 安装依赖
+      # 3. 安装依赖（版本锁定在 requirements.txt，保证行为可预测）
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install akshare pandas
+          pip install -r requirements.txt
 
       # 4. 运行每日快照脚本（快照+龙虎榜+北向+断档检查，内置时间闸门）
       - name: 运行每日快照
@@ -60,7 +60,7 @@ jobs:
       - name: 提交数据
         run: |
           git config user.name "github-actions[bot]"
-          git commit -m "数据更新：每日快照+增量追加 $(date '+%Y-%m-%d %H:%M')" --allow-empty 2>/dev/null || true
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
           if git diff --cached --quiet; then
             echo "本次没有新数据产生，跳过提交"
