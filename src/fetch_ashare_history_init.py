@@ -1,5 +1,5 @@
 """
-A股历史数据初始化脚本（baostock主源·双轮版 v6，2026-10-08）
+A股历史数据初始化脚本（baostock主源·双轮版 v7，2026-10-08）
 架构（借鉴用户旧脚本 fetch_quotes.py 的成熟经验）：
   第一轮（主源）：baostock 单线程批量拉取
     - 免费、无需注册、无限流，走私有协议不受海外IP拦截影响
@@ -13,6 +13,10 @@ A股历史数据初始化脚本（baostock主源·双轮版 v6，2026-10-08）
 - 输出：data/history/股票代码.csv，9列
   date/open/close/high/low/volume/amount/pct_chg/turnover
 - 断点续传、覆盖模式(FORCE_OVERWRITE=1)、北交所剔除、北向资金存档、体积监控
+
+v7修复：股票清单筛选逻辑bug——v6中北交所规范化返回(None,None)元组，
+  旧写法filter(None,...)无法过滤元组导致排序报错
+  'NoneType' and 'str'，改用集合推导式 if c 显式剔除。
 """
 import os
 import re
@@ -67,7 +71,7 @@ SRC_COUNT = {"baostock": 0, "东财": 0, "新浪": 0, "腾讯": 0}
 
 # ===================== 代码规范化 =====================
 def normalize_symbol(raw):
-    """'600519'/'sh600519' → ('600519','sh600519')；北交所剔除返回(None,None)"""
+    """'600519'/'sh600519' → ('600519','sh600519')；北交所或异常代码返回(None,None)"""
     s = re.sub(r'[^0-9]', '', str(raw or ''))
     if len(s) != 6:
         return None, None
@@ -255,13 +259,18 @@ def fetch_one_round2(code, symbol):
 # ===================== 股票清单（三级降级，剔除北交所） =====================
 def get_all_stock_codes():
     """返回 [(纯代码, 带前缀代码), ...]。降级：东财→交易所官网→新浪"""
+
+    def to_pairs(df, col):
+        """★v7修复★ 先规范化出(代码,前缀代码)，再 if c 剔除北交所的(None,None)"""
+        return sorted({(c, s) for c, s in (normalize_symbol(x) for x in df[col].tolist()) if c})
+
     import akshare as ak
     print("【股票清单】正在获取全市场A股代码...")
 
     for i in range(2):
         try:
             df = ak.stock_zh_a_spot_em()
-            pairs = sorted(set(filter(None, (normalize_symbol(c) for c in df["代码"].tolist()))))
+            pairs = to_pairs(df, "代码")
             print(f"【股票清单】✅ 数据源①（东财）获取成功，共 {len(pairs)} 只")
             return pairs
         except Exception as e:
@@ -271,7 +280,7 @@ def get_all_stock_codes():
     try:
         print("【股票清单】切换数据源②（交易所官网）...")
         df = ak.stock_info_a_code_name()
-        pairs = sorted(set(filter(None, (normalize_symbol(c) for c in df["code"].tolist()))))
+        pairs = to_pairs(df, "code")
         print(f"【股票清单】✅ 数据源②（交易所官网）获取成功，共 {len(pairs)} 只")
         return pairs
     except Exception as e:
@@ -280,7 +289,7 @@ def get_all_stock_codes():
     try:
         print("【股票清单】切换数据源③（新浪）...")
         df = ak.stock_zh_a_spot()
-        pairs = sorted(set(filter(None, (normalize_symbol(c) for c in df["代码"].tolist()))))
+        pairs = to_pairs(df, "代码")
         print(f"【股票清单】✅ 数据源③（新浪）获取成功，共 {len(pairs)} 只")
         return pairs
     except Exception as e:
