@@ -1,0 +1,62 @@
+name: baostock连通性测试
+
+on:
+  workflow_dispatch:      # 只能手动触发，点一下跑一次，零风险
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 配置Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装baostock
+        run: pip install baostock
+
+      - name: 单只拉取测试（600519，近10天日K）
+        run: |
+          python << 'EOF'
+          import time
+          from datetime import datetime, timedelta
+          import baostock as bs
+
+          print("===== 阶段1：登录测试（最多3次） =====")
+          ok = False
+          for i in range(3):
+              try:
+                  lg = bs.login()
+                  ok = (lg.error_code == "0")
+                  print(f"第{i+1}次登录: error_code={lg.error_code} "
+                        f"error_msg={lg.error_msg}")
+              except Exception as e:
+                  print(f"第{i+1}次登录: 异常 {type(e).__name__}: {e}")
+              if ok:
+                  break
+              time.sleep(20)
+
+          if not ok:
+              print(">>> 结论：3次登录全部失败，GitHub这台机器现在连不上baostock <<<")
+              raise SystemExit(1)
+
+          print("===== 阶段2：拉取 sh.600519 近10天日K =====")
+          start = (datetime.now() - timedelta(days=15)).strftime("%Y-%m-%d")
+          rs = bs.query_history_k_data_plus(
+              "sh.600519",
+              "date,open,high,low,close,volume,amount,pctChg,turn",
+              start_date=start, end_date="",
+              frequency="d", adjustflag="2")
+          print(f"查询返回: error_code={rs.error_code} error_msg={rs.error_msg}")
+          n = 0
+          while rs.error_code == "0" and rs.next():
+              print("  ", rs.get_row_data())
+              n += 1
+          bs.logout()
+
+          if n == 0:
+              print(">>> 登录成功但拉不到数据 <<<")
+              raise SystemExit(1)
+          print(f">>> 结论：✅ 完全连通，成功取回 {n} 根K线 <<<")
+          EOF
