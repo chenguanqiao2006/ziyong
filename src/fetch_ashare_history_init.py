@@ -21,15 +21,15 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HISTORY_DIR = os.path.join(PROJECT_ROOT, "data", "history")
 
 # ===================== 可配置参数区 =====================
-HISTORY_YEARS = 2        
-DATALEN = 550            
-MAX_WORKERS = 5          
-RETRY_TIMES = 2          
-PROGRESS_EVERY = 500     
-PROGRESS_EVERY_2 = 100   
+HISTORY_YEARS = 2
+DATALEN = 550
+MAX_WORKERS = 5
+RETRY_TIMES = 2
+PROGRESS_EVERY = 500
+PROGRESS_EVERY_2 = 100
 # 修复：适当放宽并发熔断阈值，避免多线程环境下的瞬间“误杀”
-CIRCUIT_LIMIT = 50       
-EXCLUDE_BJ = True        
+CIRCUIT_LIMIT = 50
+EXCLUDE_BJ = True
 BJ_PREFIXES = ("43", "83", "87", "88", "92")
 
 FORCE_OVERWRITE = os.environ.get("FORCE_OVERWRITE", "0") == "1"
@@ -91,9 +91,20 @@ def normalize_symbol(raw):
 def run_baostock_batch(pairs):
     import baostock as bs
 
-    lg = bs.login()
-    if lg.error_code != '0':
-        print(f"【baostock】登录失败：{lg.error_msg}")
+    # 加固：登录重试3次×10秒——手动跑时碰上服务端抖动不再一次即败
+    ok = False
+    for i in range(3):
+        try:
+            lg = bs.login()
+            ok = (lg.error_code == '0')
+        except Exception:
+            ok = False
+        if ok:
+            break
+        print(f"【baostock】登录失败({i + 1}/3)，10秒后重试...")
+        time.sleep(10)
+    if not ok:
+        print("【baostock】❌ 登录失败（服务端可能夜间不可用），全体转第二轮裸接口补拉")
         return {}, [c for c, _ in pairs]
 
     success = {}
@@ -356,43 +367,4 @@ if __name__ == "__main__":
             return "fail"
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futs = {ex.submit(worker, p): p[0] for p in round2_pairs}
-            for fut in as_completed(futs):
-                code = futs[fut]
-                try:
-                    r = fut.result()
-                except Exception as e:
-                    print(f"  {code} 异常: {type(e).__name__}: {e}")
-                    r = "fail"
-                done2 += 1
-                if r == "ok":
-                    success_count += 1
-                elif r == "empty":
-                    empty_count += 1
-                elif r == "fail":
-                    fail_list.append(code)
-                if done2 % PROGRESS_EVERY_2 == 0:
-                    elapsed = time.time() - r2_start
-                    print(f"  【第二轮】进度：{done2}/{len(round2_pairs)}，"
-                          f"成功{success_count} 空{empty_count} 败{len(fail_list)}")
-    else:
-        print("\n【第二轮】baostock 全部成功，无需补拉 🎉")
-
-    total_time = round((time.time() - start_time) / 60, 1)
-    dir_size = get_dir_size_mb(os.path.join(PROJECT_ROOT, "data"))
-    print("\n" + "=" * 60)
-    print("===== ✅ 历史数据初始化完成 =====")
-    print(f"  本次新下载：{success_count} 只")
-    print(f"  各数据源：baostock{SRC_COUNT['baostock']} 东财{SRC_COUNT['东财']} "
-          f"腾讯{SRC_COUNT['腾讯']} 新浪{SRC_COUNT['新浪']}")
-    print(f"  空数据（退市/长期停牌，正常）：{empty_count} 只")
-    print(f"  之前已下载（跳过）：{len(already)} 只")
-    print(f"  失败：{len(fail_list)} 只")
-    if fail_list:
-        print(f"  失败清单（重跑本脚本会自动重试）：{fail_list[:50]}{'...' if len(fail_list) > 50 else ''}")
-    print(f"  总耗时：{total_time} 分钟")
-    print(f"  📦 data目录总体积：{dir_size} MB")
-    if dir_size > 800:
-        print("  ⚠️⚠️⚠️ 警告：data目录已超 800MB，接近GitHub仓库1GB软限制！")
-    print("=" * 60)
-    print("💡 提示：如有失败，重跑一次即可（自动跳过成功的，只重试失败的）")
+ 
