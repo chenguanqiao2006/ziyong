@@ -1,0 +1,32 @@
+name: 数据源体检
+
+on:
+  workflow_dispatch:        # 只手动触发，纯只读探测
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install requests pytdx
+
+      - name: 语法检查（monthly新脚本，防粘贴出错）
+        run: |
+          python -m py_compile src/monthly_refresh.py && echo "✅ monthly_refresh.py 语法OK"
+
+      - name: 出口IP（诊断用，对照封禁名单）
+        run: curl -s --max-time 10 ifconfig.me || echo "IP查询失败(不影响体检)"
+
+      - name: 运行体检
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: python src/test_sources.py
