@@ -2,16 +2,22 @@ name: 月度全量刷新
 
 on:
   schedule:
-    # 每月1日 UTC 10:00 = 北京时间 18:00
+    # ── 主跑：每月1日 UTC 10:00 = 北京时间 18:00 ──
     # 依据1：baostock 日K数据当日 17:30 完成入库，18:00 拉取必含最新交易日
-    # 依据2：每日增量长期在 17:45 稳定运行，该时段服务可用性已被反复验证
+    # 依据2：每日增量长期在 17:45 稳定运行，该时段兜底源可用性已被反复验证
     # 依据3：与 daily 共用 concurrency 组，即便重叠也只是排队，不会互相覆盖
-    # ⚠️ 勿改到北京时间 23:00~08:00：baostock 夜间时段不可用（2026-10-09 01:39 实测三连败）
     - cron: '0 10 1 * *'
+    # ── 补跑：每月2日 UTC 14:00 = 北京时间 22:00（2026-10-09 新增）──
+    # 作用1：1日失败（如baostock宕机）→ 自动重试，无需人工盯守
+    # 作用2：1日成功但官方口径占比<50% → 自动重刷，把兜底数据升级为官方口径
+    # 作用3：1日完美收官 → 脚本检测到已完成，几十秒幂等退出，零副作用
+    # 注：三轮降级版对时段不敏感（baostock死了有东财/新浪兜底），
+    #     选22:00是为了和1日18:00错开，多采样一个baostock可能活着的窗口
+    - cron: '0 14 2 * *'
   workflow_dispatch:        # 手动触发（断点续跑/补跑用）
 
 permissions:
-  contents: write           # 脚本内checkpoint提交需要写权限
+  contents: write           # 数据提交需要写权限
 
 concurrency:
   group: ashare-data-pipeline   # ★ 与daily共用group，绝不并行
@@ -20,12 +26,12 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 300    # 5小时硬上限（Actions单job上限6小时）
+    timeout-minutes: 300    # 5小时硬上限（三轮降级预计40~90分钟，余量充足）
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
 
-      - name: 配置git身份（脚本内checkpoint提交要用）
+      - name: 配置git身份（收尾提交要用）
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -39,9 +45,9 @@ jobs:
       - name: 安装依赖（版本锁定）
         run: pip install -r requirements.txt
 
-      - name: 运行月度刷新
+      - name: 运行月度刷新（三轮降级版）
         env:
-          PYTHONUNBUFFERED: '1'   # 2~3小时长任务，日志实时显示
+          PYTHONUNBUFFERED: '1'   # 长任务，日志实时显示
         run: python src/monthly_refresh.py
 
       - name: 收尾提交推送
