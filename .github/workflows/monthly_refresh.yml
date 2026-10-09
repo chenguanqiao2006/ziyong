@@ -2,16 +2,19 @@ name: 月度全量刷新
 
 on:
   schedule:
-    # 修复：改为每月 1 日 UTC 18:00 = 北京时间次日(2日) 02:00
-    # 完美避开每日增量的盘后时间（北京 17:45），杜绝互相覆盖
-    - cron: '0 18 1 * *'    
-  workflow_dispatch:        # 支持手动触发（断点续跑用）
+    # 每月1日 UTC 10:00 = 北京时间 18:00
+    # 依据1：baostock 日K数据当日 17:30 完成入库，18:00 拉取必含最新交易日
+    # 依据2：每日增量长期在 17:45 稳定运行，该时段服务可用性已被反复验证
+    # 依据3：与 daily 共用 concurrency 组，即便重叠也只是排队，不会互相覆盖
+    # ⚠️ 勿改到北京时间 23:00~08:00：baostock 夜间时段不可用（2026-10-09 01:39 实测三连败）
+    - cron: '0 10 1 * *'
+  workflow_dispatch:        # 手动触发（断点续跑/补跑用）
 
 permissions:
   contents: write           # 脚本内checkpoint提交需要写权限
 
 concurrency:
-  group: ashare-data-pipeline # ★ 与daily共用group，绝不并行
+  group: ashare-data-pipeline   # ★ 与daily共用group，绝不并行
   cancel-in-progress: false
 
 jobs:
